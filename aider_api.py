@@ -15,6 +15,7 @@ from io import StringIO
 from aider import models
 from aider.coders import Coder
 from aider.commands import Commands
+from aider.scrape import Scraper, has_playwright
 from rich.console import Console
 
 from aider.io import InputOutput
@@ -203,7 +204,8 @@ class AiderAPI:
                  auto_commits: bool = True,
                  git_root: Optional[str] = None,
                  edit_format: Optional[str] = None,
-                 stream: bool = False):
+                 stream: bool = False,
+                 verify_ssl: bool = True):
         """
         Initialize Aider API instance
 
@@ -213,6 +215,7 @@ class AiderAPI:
             git_root: Git repository root directory
             edit_format: Edit format to use
             stream: Whether to use streaming output
+            verify_ssl: Whether to verify SSL certificates for web requests
         """
         self.io = APIInputOutput()
         self.model_name = model
@@ -220,10 +223,13 @@ class AiderAPI:
         self.git_root = git_root
         self.edit_format = edit_format
         self.stream = stream
+        self.verify_ssl = verify_ssl
         self.coder = None
+        self.scraper = None
         self._last_response = None
 
         self._init_coder()
+        self._init_scraper()
 
     def _init_coder(self):
         """Initialize Coder instance with proper configuration"""
@@ -241,7 +247,7 @@ class AiderAPI:
             main_model = models.Model(self.model_name)
 
             # Create Coder instance
-            self.coder = Coder.create(
+            self.coder: Coder = Coder.create(
                 main_model=main_model,
                 edit_format=self.edit_format,
                 io=self.io,
@@ -280,6 +286,294 @@ class AiderAPI:
         except Exception as e:
             raise RuntimeError(f"Failed to initialize aider: {str(e)}")
 
+    def _init_scraper(self):
+        """Initialize web scraper instance"""
+        try:
+            self.scraper = Scraper(
+                print_error=lambda msg: self.io.tool_error(f"Scraper: {msg}"),
+                playwright_available=has_playwright(),
+                verify_ssl=self.verify_ssl
+            )
+        except Exception as e:
+            self.io.tool_error(f"Failed to initialize web scraper: {str(e)}")
+            self.scraper = None
+
+    def scrape_web(self, url: str, use_playwright: Optional[bool] = None) -> Dict[str, Any]:
+        """
+        Scrape content from a URL and convert to markdown if it's HTML
+
+        Args:
+            url: URL to scrape
+            use_playwright: Force use playwright (None for auto-detect)
+
+        Returns:
+            Scraping result dictionary with content and metadata
+        """
+        if not self.scraper:
+            return {
+                'success': False,
+                'message': 'Web scraper not initialized',
+                'content': None,
+                'url': url
+            }
+
+        try:
+            self.io.clear_captured_output()
+
+            # Temporarily modify playwright setting if specified
+            original_playwright = self.scraper.playwright_available
+            if use_playwright is not None:
+                self.scraper.playwright_available = use_playwright
+
+            content = self.scraper.scrape(url)
+
+            # Restore original setting
+            self.scraper.playwright_available = original_playwright
+
+            if content:
+                return {
+                    'success': True,
+                    'message': f"Successfully scraped content from {url}",
+                    'content': content,
+                    'url': url,
+                    'content_length': len(content),
+                    'output': self.io.get_captured_output()
+                }
+            else:
+                return {
+                    'success': False,
+                    'message': f"Failed to retrieve content from {url}",
+                    'content': None,
+                    'url': url,
+                    'output': self.io.get_captured_output()
+                }
+
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f"Error scraping {url}: {str(e)}",
+                'content': None,
+                'url': url,
+                'output': self.io.get_captured_output()
+            }
+
+    def detect_urls(self, text: str) -> Dict[str, Any]:
+        """
+        Detect URLs in text content
+
+        Args:
+            text: Text to search for URLs
+
+        Returns:
+            Dictionary with detected URLs and their positions
+        """
+        import re
+
+        # URL pattern that matches http, https, ftp and www URLs
+        url_pattern = r'(?i)\b((?:https?://|ftp://|www\.)(?:[^\s<>"]+|\([^\s<>"]*\)))'
+
+        try:
+            matches = re.finditer(url_pattern, text)
+            urls = []
+
+            for match in matches:
+                url = match.group(0)
+                # Clean up URLs that start with www.
+                if url.startswith('www.'):
+                    url = 'https://' + url
+
+                urls.append({
+                    'url': url,
+                    'start': match.start(),
+                    'end': match.end(),
+                    'matched_text': match.group(0)
+                })
+
+            return {
+                'success': True,
+                'urls': urls,
+                'count': len(urls),
+                'text_sample': text[:200] + '...' if len(text) > 200 else text
+            }
+
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f"Error detecting URLs: {str(e)}",
+                'urls': [],
+                'count': 0
+            }
+
+    def ask_with_web(self, message: str, auto_scrape: bool = True) -> Dict[str, Any]:
+        """
+        Ask AI a question with automatic web scraping for URLs found in the message
+
+        Args:
+            message: User message/question
+            auto_scrape: Whether to automatically scrape detected URLs
+
+        Returns:
+            AI response result with web content if applicable
+        """
+        try:
+            self.io.clear_captured_output()
+
+            web_content = ""
+            scraped_urls = []
+
+            if auto_scrape:
+                # Detect URLs in the message
+                url_detection = self.detect_urls(message)
+                if url_detection['success'] and url_detection['count'] > 0:
+                    self.io.tool_output(f"Found {url_detection['count']} URL(s) in message, scraping...")
+
+                    for url_info in url_detection['urls']:
+                        url = url_info['url']
+                        scrape_result = self.scrape_web(url)
+
+                        if scrape_result['success']:
+                            scraped_urls.append(url)
+                            # Add scraped content to context
+                            web_content += f"\n\n--- Content from {url} ---\n"
+                            web_content += scrape_result['content'][:2000]  # Limit to 2000 chars per URL
+                            if len(scrape_result['content']) > 2000:
+                                web_content += "\n... [content truncated]"
+                        else:
+                            self.io.tool_error(f"Failed to scrape {url}: {scrape_result['message']}")
+
+            # Combine original message with web content
+            enhanced_message = message
+            if web_content:
+                enhanced_message = message + web_content
+
+            # Execute enhanced message
+            self.coder.run_one(enhanced_message, preproc=True)
+
+            # Get response content
+            response = self.coder.partial_response_content
+
+            return {
+                'success': True,
+                'message': "Question processed successfully",
+                'response': response,
+                'scraped_urls': scraped_urls,
+                'url_count': len(scraped_urls),
+                'output': self.io.get_captured_output()
+            }
+
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f"Failed to process question with web content: {str(e)}",
+                'response': None,
+                'scraped_urls': [],
+                'url_count': 0,
+                'output': self.io.get_captured_output()
+            }
+
+    def web_search_and_ask(self, query: str, search_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Perform web search/scrape and then ask AI about the content
+
+        Args:
+            query: Question or topic to research
+            search_urls: Optional list of URLs to scrape (if None, will look for URLs in query)
+
+        Returns:
+            AI response with web research results
+        """
+        try:
+            self.io.clear_captured_output()
+
+            urls_to_scrape = search_urls or []
+            scraped_content = []
+            scraped_urls = []
+
+            # If no URLs provided, detect them in the query
+            if not urls_to_scrape:
+                url_detection = self.detect_urls(query)
+                if url_detection['success']:
+                    urls_to_scrape = [url_info['url'] for url_info in url_detection['urls']]
+
+            # Scrape URLs
+            if urls_to_scrape:
+                self.io.tool_output(f"Scraping {len(urls_to_scrape)} URL(s) for research...")
+
+                for url in urls_to_scrape:
+                    scrape_result = self.scrape_web(url)
+                    if scrape_result['success']:
+                        scraped_urls.append(url)
+                        scraped_content.append(f"Source: {url}\n{scrape_result['content']}")
+                    else:
+                        self.io.tool_error(f"Failed to scrape {url}: {scrape_result['message']}")
+
+            # Prepare research context
+            research_context = ""
+            if scraped_content:
+                research_context = "\n\n=== WEB RESEARCH ===\n"
+                research_context += "\n\n".join(scraped_content)
+                research_context += "\n=== END RESEARCH ===\n\n"
+
+            # Enhanced prompt with research context
+            enhanced_query = f"""Research Context: {research_context}
+
+User Question: {query}
+
+Please provide a comprehensive answer based on the above research context and your knowledge."""
+
+            # Execute query with research context
+            self.coder.run_one(enhanced_query, preproc=True)
+            response = self.coder.partial_response_content
+
+            return {
+                'success': True,
+                'message': "Research and query completed successfully",
+                'response': response,
+                'scraped_urls': scraped_urls,
+                'sources_count': len(scraped_urls),
+                'research_context_length': len(research_context),
+                'output': self.io.get_captured_output()
+            }
+
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f"Failed to perform research: {str(e)}",
+                'response': None,
+                'scraped_urls': [],
+                'sources_count': 0,
+                'research_context_length': 0,
+                'output': self.io.get_captured_output()
+            }
+
+    def get_scraper_info(self) -> Dict[str, Any]:
+        """
+        Get information about the web scraper configuration and capabilities
+
+        Returns:
+            Scraper information dictionary
+        """
+        if not self.scraper:
+            return {
+                'scraper_initialized': False,
+                'playwright_available': False,
+                'ssl_verification': self.verify_ssl
+            }
+
+        return {
+            'scraper_initialized': True,
+            'playwright_available': has_playwright(),
+            'scraper_playwright_available': self.scraper.playwright_available,
+            'ssl_verification': self.verify_ssl,
+            'pandoc_available': getattr(self.scraper, 'pandoc_available', None),
+            'capabilities': {
+                'can_use_playwright': has_playwright(),
+                'can_use_httpx': True,
+                'can_convert_html_to_markdown': True,
+                'can_handle_ssl_errors': not self.verify_ssl
+            }
+        }
+
     def add_file(self, file_path: str) -> Dict[str, Any]:
         """
         Add file to context, equivalent to /add command
@@ -292,7 +586,7 @@ class AiderAPI:
         """
         try:
             self.io.clear_captured_output()
-            result = self.coder.commands.cmd_add(file_path)
+            self.coder.commands.cmd_add(file_path)
 
             return {
                 'success': True,
@@ -320,7 +614,7 @@ class AiderAPI:
         """
         try:
             self.io.clear_captured_output()
-            result = self.coder.commands.cmd_drop(file_path)
+            self.coder.commands.cmd_drop(file_path)
 
             return {
                 'success': True,
@@ -381,7 +675,7 @@ class AiderAPI:
         """
         try:
             self.io.clear_captured_output()
-            result = self.coder.commands.cmd_commit(commit_message)
+            self.coder.commands.cmd_commit(commit_message)
 
             return {
                 'success': True,
@@ -516,20 +810,47 @@ class AiderAPI:
 
 # Usage example
 if __name__ == "__main__":
-    # Create API instance
-    aider = AiderAPI(model="gpt-4", auto_commits=True)
+    # Create API instance with web scraping enabled
+    aider = AiderAPI(model="gpt-4", auto_commits=True, verify_ssl=True)
+
+    # Check scraper capabilities
+    print("Checking scraper info...")
+    scraper_info = aider.get_scraper_info()
+    print(f"Scraper info: {scraper_info}")
+
+    # Basic web scraping
+    print("\nScraping web page...")
+    scrape_result = aider.scrape_web("https://example.com")
+    print(f"Scrape result: {scrape_result['success']}, Content length: {scrape_result.get('content_length', 0)}")
+
+    # URL detection
+    print("\nDetecting URLs in text...")
+    text_with_urls = "Check out https://github.com and www.openai.com for more info"
+    url_detection = aider.detect_urls(text_with_urls)
+    print(f"Detected URLs: {url_detection['urls']}")
 
     # Add file
-    print("Adding file...")
+    print("\nAdding file...")
     result = aider.add_file("example.py")
     print(f"Add result: {result}")
 
-    # Ask question
-    print("Asking question...")
+    # Ask question with automatic web scraping
+    print("\nAsking question with web scraping...")
+    result = aider.ask_with_web("What can you tell me about https://httpbin.org/html?", auto_scrape=True)
+    print(f"Ask with web result: {result['success']}, Scraped URLs: {result.get('scraped_urls', [])}")
+
+    # Research specific URLs
+    print("\nPerforming web research...")
+    research_urls = ["https://httpbin.org/json", "https://httpbin.org/uuid"]
+    research_result = aider.web_search_and_ask("What do these endpoints return?", search_urls=research_urls)
+    print(f"Research result: {research_result['success']}, Sources: {research_result.get('sources_count', 0)}")
+
+    # Regular ask question
+    print("\nAsking regular question...")
     result = aider.ask("Please help me understand this code")
     print(f"Ask result: {result}")
 
     # Commit changes
-    print("Committing changes...")
+    print("\nCommitting changes...")
     result = aider.commit("Update code with AI assistance")
     print(f"Commit result: {result}")
