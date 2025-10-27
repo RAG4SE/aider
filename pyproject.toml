@@ -35,6 +35,7 @@ playwright = { file = "requirements/requirements-playwright.txt" }
 
 [tool.setuptools]
 include-package-data = true
+py-modules = ["aider_api"]
 
 [tool.setuptools.packages.find]
 include = ["aider"]

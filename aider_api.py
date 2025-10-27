@@ -11,8 +11,6 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from io import StringIO
 
-# Add aider to path
-sys.path.insert(0, str(Path(__file__).parent))
 
 from aider import models
 from aider.coders import Coder
